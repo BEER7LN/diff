@@ -1,357 +1,305 @@
-
-BIGNUM *BN_mod_sqrt(BIGNUM *in, const BIGNUM *a, const BIGNUM *p, BN_CTX *ctx)
-/*
- * Returns 'ret' such that ret^2 == a (mod p), using the Tonelli/Shanks
- * algorithm (cf. Henri Cohen, "A Course in Algebraic Computational Number
- * Theory", algorithm 1.5.1). 'p' must be prime, otherwise an error or
- * an incorrect "result" will be returned.
- */
+CURLcode Curl_http_header(struct Curl_easy *data, struct connectdata *conn,
+                          char *headp)
 {
-    BIGNUM *ret = in;
-    int err = 1;
-    int r;
-    BIGNUM *A, *b, *q, *t, *x, *y;
-    int e, i, j;
-    int used_ctx = 0;
-
-    if (!BN_is_odd(p) || BN_abs_is_word(p, 1)) {
-        if (BN_abs_is_word(p, 2)) {
-            if (ret == NULL)
-                ret = BN_new();
-            if (ret == NULL)
-                goto end;
-            if (!BN_set_word(ret, BN_is_bit_set(a, 0))) {
-                if (ret != in)
-                    BN_free(ret);
-                return NULL;
-            }
-            bn_check_top(ret);
-            return ret;
-        }
-
-        ERR_raise(ERR_LIB_BN, BN_R_P_IS_NOT_PRIME);
-        return NULL;
+  CURLcode result;
+  struct SingleRequest *k = &data->req;
+  /* Check for Content-Length: header lines to get size */
+  if(!k->http_bodyless &&
+     !data->set.ignorecl && checkprefix("Content-Length:", headp)) {
+    curl_off_t contentlength;
+    CURLofft offt = curlx_strtoofft(headp + strlen("Content-Length:"),
+                                    NULL, 10, &contentlength);
+    if(offt == CURL_OFFT_OK) {
+      k->size = contentlength;
+      k->maxdownload = k->size;
     }
-
-    if (BN_is_zero(a) || BN_is_one(a)) {
-        if (ret == NULL)
-            ret = BN_new();
-        if (ret == NULL)
-            goto end;
-        if (!BN_set_word(ret, BN_is_one(a))) {
-            if (ret != in)
-                BN_free(ret);
-            return NULL;
-        }
-        bn_check_top(ret);
-        return ret;
+    else if(offt == CURL_OFFT_FLOW) {
+      /* out of range */
+      if(data->set.max_filesize) {
+        failf(data, "Maximum file size exceeded");
+        return CURLE_FILESIZE_EXCEEDED;
+      }
+      streamclose(conn, "overflow content-length");
+      infof(data, "Overflow Content-Length: value");
     }
-
-    BN_CTX_start(ctx);
-    used_ctx = 1;
-    A = BN_CTX_get(ctx);
-    b = BN_CTX_get(ctx);
-    q = BN_CTX_get(ctx);
-    t = BN_CTX_get(ctx);
-    x = BN_CTX_get(ctx);
-    y = BN_CTX_get(ctx);
-    if (y == NULL)
-        goto end;
-
-    if (ret == NULL)
-        ret = BN_new();
-    if (ret == NULL)
-        goto end;
-
-    /* A = a mod p */
-    if (!BN_nnmod(A, a, p, ctx))
-        goto end;
-
-    /* now write  |p| - 1  as  2^e*q  where  q  is odd */
-    e = 1;
-    while (!BN_is_bit_set(p, e))
-        e++;
-    /* we'll set  q  later (if needed) */
-
-    if (e == 1) {
-        /*-
-         * The easy case:  (|p|-1)/2  is odd, so 2 has an inverse
-         * modulo  (|p|-1)/2,  and square roots can be computed
-         * directly by modular exponentiation.
-         * We have
-         *     2 * (|p|+1)/4 == 1   (mod (|p|-1)/2),
-         * so we can use exponent  (|p|+1)/4,  i.e.  (|p|-3)/4 + 1.
-         */
-        if (!BN_rshift(q, p, 2))
-            goto end;
-        q->neg = 0;
-        if (!BN_add_word(q, 1))
-            goto end;
-        if (!BN_mod_exp(ret, A, q, p, ctx))
-            goto end;
-        err = 0;
-        goto vrfy;
+    else {
+      /* negative or just rubbish - bad HTTP */
+      failf(data, "Invalid Content-Length: value");
+      return CURLE_WEIRD_SERVER_REPLY;
     }
-
-    if (e == 2) {
-        /*-
-         * |p| == 5  (mod 8)
-         *
-         * In this case  2  is always a non-square since
-         * Legendre(2,p) = (-1)^((p^2-1)/8)  for any odd prime.
-         * So if  a  really is a square, then  2*a  is a non-square.
-         * Thus for
-         *      b := (2*a)^((|p|-5)/8),
-         *      i := (2*a)*b^2
-         * we have
-         *     i^2 = (2*a)^((1 + (|p|-5)/4)*2)
-         *         = (2*a)^((p-1)/2)
-         *         = -1;
-         * so if we set
-         *      x := a*b*(i-1),
-         * then
-         *     x^2 = a^2 * b^2 * (i^2 - 2*i + 1)
-         *         = a^2 * b^2 * (-2*i)
-         *         = a*(-i)*(2*a*b^2)
-         *         = a*(-i)*i
-         *         = a.
-         *
-         * (This is due to A.O.L. Atkin,
-         * Subject: Square Roots and Cognate Matters modulo p=8n+5.
-         * URL: https://listserv.nodak.edu/cgi-bin/wa.exe?A2=ind9211&L=NMBRTHRY&P=4026
-         * November 1992.)
-         */
-
-        /* t := 2*a */
-        if (!BN_mod_lshift1_quick(t, A, p))
-            goto end;
-
-        /* b := (2*a)^((|p|-5)/8) */
-        if (!BN_rshift(q, p, 3))
-            goto end;
-        q->neg = 0;
-        if (!BN_mod_exp(b, t, q, p, ctx))
-            goto end;
-
-        /* y := b^2 */
-        if (!BN_mod_sqr(y, b, p, ctx))
-            goto end;
-
-        /* t := (2*a)*b^2 - 1 */
-        if (!BN_mod_mul(t, t, y, p, ctx))
-            goto end;
-        if (!BN_sub_word(t, 1))
-            goto end;
-
-        /* x = a*b*t */
-        if (!BN_mod_mul(x, A, b, p, ctx))
-            goto end;
-        if (!BN_mod_mul(x, x, t, p, ctx))
-            goto end;
-
-        if (!BN_copy(ret, x))
-            goto end;
-        err = 0;
-        goto vrfy;
+  }
+  /* check for Content-Type: header lines to get the MIME-type */
+  else if(checkprefix("Content-Type:", headp)) {
+    char *contenttype = Curl_copy_header_value(headp);
+    if(!contenttype)
+      return CURLE_OUT_OF_MEMORY;
+    if(!*contenttype)
+      /* ignore empty data */
+      free(contenttype);
+    else {
+      Curl_safefree(data->info.contenttype);
+      data->info.contenttype = contenttype;
     }
-
+  }
+#ifndef CURL_DISABLE_PROXY
+  else if((conn->httpversion == 10) &&
+          conn->bits.httpproxy &&
+          Curl_compareheader(headp,
+                             STRCONST("Proxy-Connection:"),
+                             STRCONST("keep-alive"))) {
     /*
-     * e > 2, so we really have to use the Tonelli/Shanks algorithm. First,
-     * find some y that is not a square.
+     * When an HTTP/1.0 reply comes when using a proxy, the
+     * 'Proxy-Connection: keep-alive' line tells us the
+     * connection will be kept alive for our pleasure.
+     * Default action for 1.0 is to close.
      */
-    if (!BN_copy(q, p))
-        goto end;               /* use 'q' as temp */
-    q->neg = 0;
-    i = 2;
-    do {
-        /*
-         * For efficiency, try small numbers first; if this fails, try random
-         * numbers.
-         */
-        if (i < 22) {
-            if (!BN_set_word(y, i))
-                goto end;
-        } else {
-            if (!BN_priv_rand_ex(y, BN_num_bits(p), 0, 0, 0, ctx))
-                goto end;
-            if (BN_ucmp(y, p) >= 0) {
-                if (!(p->neg ? BN_add : BN_sub) (y, y, p))
-                    goto end;
-            }
-            /* now 0 <= y < |p| */
-            if (BN_is_zero(y))
-                if (!BN_set_word(y, i))
-                    goto end;
-        }
-
-        r = BN_kronecker(y, q, ctx); /* here 'q' is |p| */
-        if (r < -1)
-            goto end;
-        if (r == 0) {
-            /* m divides p */
-            ERR_raise(ERR_LIB_BN, BN_R_P_IS_NOT_PRIME);
-            goto end;
-        }
-    }
-    while (r == 1 && ++i < 82);
-
-    if (r != -1) {
-        /*
-         * Many rounds and still no non-square -- this is more likely a bug
-         * than just bad luck. Even if p is not prime, we should have found
-         * some y such that r == -1.
-         */
-        ERR_raise(ERR_LIB_BN, BN_R_TOO_MANY_ITERATIONS);
-        goto end;
-    }
-
-    /* Here's our actual 'q': */
-    if (!BN_rshift(q, q, e))
-        goto end;
-
+    connkeep(conn, "Proxy-Connection keep-alive"); /* don't close */
+    infof(data, "HTTP/1.0 proxy connection set to keep alive");
+  }
+  else if((conn->httpversion == 11) &&
+          conn->bits.httpproxy &&
+          Curl_compareheader(headp,
+                             STRCONST("Proxy-Connection:"),
+                             STRCONST("close"))) {
     /*
-     * Now that we have some non-square, we can find an element of order 2^e
-     * by computing its q'th power.
+     * We get an HTTP/1.1 response from a proxy and it says it'll
+     * close down after this transfer.
      */
-    if (!BN_mod_exp(y, y, q, p, ctx))
-        goto end;
-    if (BN_is_one(y)) {
-        ERR_raise(ERR_LIB_BN, BN_R_P_IS_NOT_PRIME);
-        goto end;
-    }
-
-    /*-
-     * Now we know that (if  p  is indeed prime) there is an integer
-     * k,  0 <= k < 2^e,  such that
+    connclose(conn, "Proxy-Connection: asked to close after done");
+    infof(data, "HTTP/1.1 proxy connection set close");
+  }
+#endif
+  else if((conn->httpversion == 10) &&
+          Curl_compareheader(headp,
+                             STRCONST("Connection:"),
+                             STRCONST("keep-alive"))) {
+    /*
+     * An HTTP/1.0 reply with the 'Connection: keep-alive' line
+     * tells us the connection will be kept alive for our
+     * pleasure.  Default action for 1.0 is to close.
      *
-     *      a^q * y^k == 1   (mod p).
-     *
-     * As  a^q  is a square and  y  is not,  k  must be even.
-     * q+1  is even, too, so there is an element
-     *
-     *     X := a^((q+1)/2) * y^(k/2),
-     *
-     * and it satisfies
-     *
-     *     X^2 = a^q * a     * y^k
-     *         = a,
-     *
-     * so it is the square root that we are looking for.
+     * [RFC2068, section 19.7.1] */
+    connkeep(conn, "Connection keep-alive");
+    infof(data, "HTTP/1.0 connection set to keep alive");
+  }
+  else if(Curl_compareheader(headp,
+                             STRCONST("Connection:"), STRCONST("close"))) {
+    /*
+     * [RFC 2616, section 8.1.2.1]
+     * "Connection: close" is HTTP/1.1 language and means that
+     * the connection will close when this request has been
+     * served.
      */
-
-    /* t := (q-1)/2  (note that  q  is odd) */
-    if (!BN_rshift1(t, q))
-        goto end;
-
-    /* x := a^((q-1)/2) */
-    if (BN_is_zero(t)) {        /* special case: p = 2^e + 1 */
-        if (!BN_nnmod(t, A, p, ctx))
-            goto end;
-        if (BN_is_zero(t)) {
-            /* special case: a == 0  (mod p) */
-            BN_zero(ret);
-            err = 0;
-            goto end;
-        } else if (!BN_one(x))
-            goto end;
-    } else {
-        if (!BN_mod_exp(x, A, t, p, ctx))
-            goto end;
-        if (BN_is_zero(x)) {
-            /* special case: a == 0  (mod p) */
-            BN_zero(ret);
-            err = 0;
-            goto end;
-        }
+    streamclose(conn, "Connection: close used");
+  }
+  else if(!k->http_bodyless && checkprefix("Transfer-Encoding:", headp)) {
+    /* One or more encodings. We check for chunked and/or a compression
+       algorithm. */
+    /*
+     * [RFC 2616, section 3.6.1] A 'chunked' transfer encoding
+     * means that the server will send a series of "chunks". Each
+     * chunk starts with line with info (including size of the
+     * coming block) (terminated with CRLF), then a block of data
+     * with the previously mentioned size. There can be any amount
+     * of chunks, and a chunk-data set to zero signals the
+     * end-of-chunks. */
+    result = Curl_build_unencoding_stack(data,
+                                         headp + strlen("Transfer-Encoding:"),
+                                         TRUE);
+    if(result)
+      return result;
+    if(!k->chunk) {
+      /* if this isn't chunked, only close can signal the end of this transfer
+         as Content-Length is said not to be trusted for transfer-encoding! */
+      connclose(conn, "HTTP/1.1 transfer-encoding without chunks");
+      k->ignore_cl = TRUE;
     }
-
-    /* b := a*x^2  (= a^q) */
-    if (!BN_mod_sqr(b, x, p, ctx))
-        goto end;
-    if (!BN_mod_mul(b, b, A, p, ctx))
-        goto end;
-
-    /* x := a*x    (= a^((q+1)/2)) */
-    if (!BN_mod_mul(x, x, A, p, ctx))
-        goto end;
-
-    while (1) {
-        /*-
-         * Now  b  is  a^q * y^k  for some even  k  (0 <= k < 2^E
-         * where  E  refers to the original value of  e,  which we
-         * don't keep in a variable),  and  x  is  a^((q+1)/2) * y^(k/2).
-         *
-         * We have  a*b = x^2,
-         *    y^2^(e-1) = -1,
-         *    b^2^(e-1) = 1.
-         */
-
-        if (BN_is_one(b)) {
-            if (!BN_copy(ret, x))
-                goto end;
-            err = 0;
-            goto vrfy;
-        }
-
-        /* Find the smallest i, 0 < i < e, such that b^(2^i) = 1. */
-        for (i = 1; i < e; i++) {
-            if (i == 1) {
-                if (!BN_mod_sqr(t, b, p, ctx))
-                    goto end;
-
-            } else {
-                if (!BN_mod_mul(t, t, t, p, ctx))
-                    goto end;
-            }
-            if (BN_is_one(t))
-                break;
-        }
-        /* If not found, a is not a square or p is not prime. */
-        if (i >= e) {
-            ERR_raise(ERR_LIB_BN, BN_R_NOT_A_SQUARE);
-            goto end;
-        }
-
-        /* t := y^2^(e - i - 1) */
-        if (!BN_copy(t, y))
-            goto end;
-        for (j = e - i - 1; j > 0; j--) {
-            if (!BN_mod_sqr(t, t, p, ctx))
-                goto end;
-        }
-        if (!BN_mod_mul(y, t, t, p, ctx))
-            goto end;
-        if (!BN_mod_mul(x, x, t, p, ctx))
-            goto end;
-        if (!BN_mod_mul(b, b, y, p, ctx))
-            goto end;
-        e = i;
+  }
+  else if(!k->http_bodyless && checkprefix("Content-Encoding:", headp) &&
+          data->set.str[STRING_ENCODING]) {
+    /*
+     * Process Content-Encoding. Look for the values: identity,
+     * gzip, deflate, compress, x-gzip and x-compress. x-gzip and
+     * x-compress are the same as gzip and compress. (Sec 3.5 RFC
+     * 2616). zlib cannot handle compress.  However, errors are
+     * handled further down when the response body is processed
+     */
+    result = Curl_build_unencoding_stack(data,
+                                         headp + strlen("Content-Encoding:"),
+                                         FALSE);
+    if(result)
+      return result;
+  }
+  else if(checkprefix("Retry-After:", headp)) {
+    /* Retry-After = HTTP-date / delay-seconds */
+    curl_off_t retry_after = 0; /* zero for unknown or "now" */
+    /* Try it as a decimal number, if it works it is not a date */
+    (void)curlx_strtoofft(headp + strlen("Retry-After:"),
+                          NULL, 10, &retry_after);
+    if(!retry_after) {
+      time_t date = Curl_getdate_capped(headp + strlen("Retry-After:"));
+      if(-1 != date)
+        /* convert date to number of seconds into the future */
+        retry_after = date - time(NULL);
     }
-
- vrfy:
-    if (!err) {
-        /*
-         * verify the result -- the input might have been not a square (test
-         * added in 0.9.8)
-         */
-
-        if (!BN_mod_sqr(x, ret, p, ctx))
-            err = 1;
-
-        if (!err && 0 != BN_cmp(x, A)) {
-            ERR_raise(ERR_LIB_BN, BN_R_NOT_A_SQUARE);
-            err = 1;
-        }
+    data->info.retry_after = retry_after; /* store it */
+  }
+  else if(!k->http_bodyless && checkprefix("Content-Range:", headp)) {
+    /* Content-Range: bytes [num]-
+       Content-Range: bytes: [num]-
+       Content-Range: [num]-
+       Content-Range: [asterisk]/[total]
+       The second format was added since Sun's webserver
+       JavaWebServer/1.1.1 obviously sends the header this way!
+       The third added since some servers use that!
+       The fourth means the requested range was unsatisfied.
+    */
+    char *ptr = headp + strlen("Content-Range:");
+    /* Move forward until first digit or asterisk */
+    while(*ptr && !ISDIGIT(*ptr) && *ptr != '*')
+      ptr++;
+    /* if it truly stopped on a digit */
+    if(ISDIGIT(*ptr)) {
+      if(!curlx_strtoofft(ptr, NULL, 10, &k->offset)) {
+        if(data->state.resume_from == k->offset)
+          /* we asked for a resume and we got it */
+          k->content_range = TRUE;
+      }
     }
-
- end:
-    if (err) {
-        if (ret != in)
-            BN_clear_free(ret);
-        ret = NULL;
+    else
+      data->state.resume_from = 0; /* get everything */
+  }
+#if !defined(CURL_DISABLE_COOKIES)
+  else if(data->cookies && data->state.cookie_engine &&
+          checkprefix("Set-Cookie:", headp)) {
+    /* If there is a custom-set Host: name, use it here, or else use real peer
+       host name. */
+    const char *host = data->state.aptr.cookiehost?
+      data->state.aptr.cookiehost:conn->host.name;
+    const bool secure_context =
+      conn->handler->protocol&(CURLPROTO_HTTPS|CURLPROTO_WSS) ||
+      strcasecompare("localhost", host) ||
+      !strcmp(host, "127.0.0.1") ||
+      !strcmp(host, "[::1]") ? TRUE : FALSE;
+    Curl_share_lock(data, CURL_LOCK_DATA_COOKIE,
+                    CURL_LOCK_ACCESS_SINGLE);
+    Curl_cookie_add(data, data->cookies, TRUE, FALSE,
+                    headp + strlen("Set-Cookie:"), host,
+                    data->state.up.path, secure_context);
+    Curl_share_unlock(data, CURL_LOCK_DATA_COOKIE);
+  }
+#endif
+  else if(!k->http_bodyless && checkprefix("Last-Modified:", headp) &&
+          (data->set.timecondition || data->set.get_filetime) ) {
+    k->timeofdoc = Curl_getdate_capped(headp + strlen("Last-Modified:"));
+    if(data->set.get_filetime)
+      data->info.filetime = k->timeofdoc;
+  }
+  else if((checkprefix("WWW-Authenticate:", headp) &&
+           (401 == k->httpcode)) ||
+          (checkprefix("Proxy-authenticate:", headp) &&
+           (407 == k->httpcode))) {
+    bool proxy = (k->httpcode == 407) ? TRUE : FALSE;
+    char *auth = Curl_copy_header_value(headp);
+    if(!auth)
+      return CURLE_OUT_OF_MEMORY;
+    result = Curl_http_input_auth(data, proxy, auth);
+    free(auth);
+    if(result)
+      return result;
+  }
+#ifdef USE_SPNEGO
+  else if(checkprefix("Persistent-Auth:", headp)) {
+    struct negotiatedata *negdata = &conn->negotiate;
+    struct auth *authp = &data->state.authhost;
+    if(authp->picked == CURLAUTH_NEGOTIATE) {
+      char *persistentauth = Curl_copy_header_value(headp);
+      if(!persistentauth)
+        return CURLE_OUT_OF_MEMORY;
+      negdata->noauthpersist = checkprefix("false", persistentauth)?
+        TRUE:FALSE;
+      negdata->havenoauthpersist = TRUE;
+      infof(data, "Negotiate: noauthpersist -> %d, header part: %s",
+            negdata->noauthpersist, persistentauth);
+      free(persistentauth);
     }
-    if (used_ctx)
-        BN_CTX_end(ctx);
-    bn_check_top(ret);
-    return ret;
+  }
+#endif
+  else if((k->httpcode >= 300 && k->httpcode < 400) &&
+          checkprefix("Location:", headp) &&
+          !data->req.location) {
+    /* this is the URL that the server advises us to use instead */
+    char *location = Curl_copy_header_value(headp);
+    if(!location)
+      return CURLE_OUT_OF_MEMORY;
+    if(!*location)
+      /* ignore empty data */
+      free(location);
+    else {
+      data->req.location = location;
+      if(data->set.http_follow_location) {
+        DEBUGASSERT(!data->req.newurl);
+        data->req.newurl = strdup(data->req.location); /* clone */
+        if(!data->req.newurl)
+          return CURLE_OUT_OF_MEMORY;
+        /* some cases of POST and PUT etc needs to rewind the data
+           stream at this point */
+        result = http_perhapsrewind(data, conn);
+        if(result)
+          return result;
+        /* mark the next request as a followed location: */
+        data->state.this_is_a_follow = TRUE;
+      }
+    }
+  }
+#ifndef CURL_DISABLE_HSTS
+  /* If enabled, the header is incoming and this is over HTTPS */
+  else if(data->hsts && checkprefix("Strict-Transport-Security:", headp) &&
+          ((conn->handler->flags & PROTOPT_SSL) ||
+#ifdef CURLDEBUG
+           /* allow debug builds to circumvent the HTTPS restriction */
+           getenv("CURL_HSTS_HTTP")
+#else
+           0
+#endif
+            )) {
+    CURLcode check =
+      Curl_hsts_parse(data->hsts, data->state.up.hostname,
+                      headp + strlen("Strict-Transport-Security:"));
+    if(check)
+      infof(data, "Illegal STS header skipped");
+#ifdef DEBUGBUILD
+    else
+      infof(data, "Parsed STS header fine (%zu entries)",
+            data->hsts->list.size);
+#endif
+  }
+#endif
+#ifndef CURL_DISABLE_ALTSVC
+  /* If enabled, the header is incoming and this is over HTTPS */
+  else if(data->asi && checkprefix("Alt-Svc:", headp) &&
+          ((conn->handler->flags & PROTOPT_SSL) ||
+#ifdef CURLDEBUG
+           /* allow debug builds to circumvent the HTTPS restriction */
+           getenv("CURL_ALTSVC_HTTP")
+#else
+           0
+#endif
+            )) {
+    /* the ALPN of the current request */
+    enum alpnid id = (conn->httpversion == 20) ? ALPN_h2 : ALPN_h1;
+    result = Curl_altsvc_parse(data, data->asi,
+                               headp + strlen("Alt-Svc:"),
+                               id, conn->host.name,
+                               curlx_uitous((unsigned int)conn->remote_port));
+    if(result)
+      return result;
+  }
+#endif
+  else if(conn->handler->protocol & CURLPROTO_RTSP) {
+    result = Curl_rtsp_parseheader(data, headp);
+    if(result)
+      return result;
+  }
+  return CURLE_OK;
 }
