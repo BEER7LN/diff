@@ -1,1023 +1,644 @@
-src/rfc3315.c-dhcp6_no_relay": " static int dhcp6_no_relay(struct state *state, int msg_type, void *inbuff, size_t sz, int is_unicast, time_t now)
- {
-   void *opt;
-   int i, o, o1, start_opts;
-   struct dhcp_opt *opt_cfg;
-   struct dhcp_netid *tagif;
-   struct dhcp_config *config = NULL;
-   struct dhcp_netid known_id, iface_id, v6_id;
-   unsigned char *outmsgtypep;
-   struct dhcp_vendor *vendor;
-   struct dhcp_context *context_tmp;
-   struct dhcp_mac *mac_opt;
-   unsigned int ignore = 0;
- 
-   state->packet_options = inbuff + 4;
-   state->end = inbuff + sz;
-   state->clid = NULL;
-   state->clid_len = 0;
-   state->lease_allocate = 0;
-   state->context_tags = NULL;
-   state->domain = NULL;
-   state->send_domain = NULL;
-   state->hostname_auth = 0;
-   state->hostname = NULL;
-   state->client_hostname = NULL;
-   state->fqdn_flags = 0x01; /* default to send if we receive no FQDN option */
- 
-   /* set tag with name == interface */
-   iface_id.net = state->iface_name;
-   iface_id.next = state->tags;
-   state->tags = &iface_id; 
- 
-   /* set tag "dhcpv6" */
-   v6_id.net = "dhcpv6";
-   v6_id.next = state->tags;
-   state->tags = &v6_id;
- 
-   /* copy over transaction-id, and save pointer to message type */
-   if (!(outmsgtypep = put_opt6(inbuff, 4)))
-     return 0;
-   start_opts = save_counter(-1);
-   state->xid = outmsgtypep[3] | outmsgtypep[2] << 8 | outmsgtypep[1] << 16;
-    
-   /* We're going to be linking tags from all context we use. 
-      mark them as unused so we don't link one twice and break the list */
-   for (context_tmp = state->context; context_tmp; context_tmp = context_tmp->current)
-     {
-       context_tmp->netid.next = &context_tmp->netid;
- 
-       if (option_bool(OPT_LOG_OPTS))
-         {
-            inet_ntop(AF_INET6, &context_tmp->start6, daemon->dhcp_buff, ADDRSTRLEN); 
-            inet_ntop(AF_INET6, &context_tmp->end6, daemon->dhcp_buff2, ADDRSTRLEN); 
-            if (context_tmp->flags & (CONTEXT_STATIC))
-              my_syslog(MS_DHCP | LOG_INFO, _("%u available DHCPv6 subnet: %s/%d"),
-                        state->xid, daemon->dhcp_buff, context_tmp->prefix);
-            else
-              my_syslog(MS_DHCP | LOG_INFO, _("%u available DHCP range: %s -- %s"), 
-                        state->xid, daemon->dhcp_buff, daemon->dhcp_buff2);
-         }
-     }
- 
-   if ((opt = opt6_find(state->packet_options, state->end, OPTION6_CLIENT_ID, 1)))
-     {
-       state->clid = opt6_ptr(opt, 0);
-       state->clid_len = opt6_len(opt);
-       o = new_opt6(OPTION6_CLIENT_ID);
-       put_opt6(state->clid, state->clid_len);
-       end_opt6(o);
-     }
-   else if (msg_type != DHCP6IREQ)
-     return 0;
- 
-   /* server-id must match except for SOLICIT, CONFIRM and REBIND messages */
-   if (msg_type != DHCP6SOLICIT && msg_type != DHCP6CONFIRM && msg_type != DHCP6IREQ && msg_type != DHCP6REBIND &&
-       (!(opt = opt6_find(state->packet_options, state->end, OPTION6_SERVER_ID, 1)) ||
-        opt6_len(opt) != daemon->duid_len ||
-        memcmp(opt6_ptr(opt, 0), daemon->duid, daemon->duid_len) != 0))
-     return 0;
-   
-   o = new_opt6(OPTION6_SERVER_ID);
-   put_opt6(daemon->duid, daemon->duid_len);
-   end_opt6(o);
- 
-   if (is_unicast &&
-       (msg_type == DHCP6REQUEST || msg_type == DHCP6RENEW || msg_type == DHCP6RELEASE || msg_type == DHCP6DECLINE))
-     
-     {  
-       *outmsgtypep = DHCP6REPLY;
-       o1 = new_opt6(OPTION6_STATUS_CODE);
-       put_opt6_short(DHCP6USEMULTI);
-       put_opt6_string("Use multicast");
-       end_opt6(o1);
-       return 1;
-     }
- 
-   /* match vendor and user class options */
-   for (vendor = daemon->dhcp_vendors; vendor; vendor = vendor->next)
-     {
-       int mopt;
-       
-       if (vendor->match_type == MATCH_VENDOR)
-         mopt = OPTION6_VENDOR_CLASS;
-       else if (vendor->match_type == MATCH_USER)
-         mopt = OPTION6_USER_CLASS; 
-       else
-         continue;
- 
-       if ((opt = opt6_find(state->packet_options, state->end, mopt, 2)))
-         {
-           void *enc_opt, *enc_end = opt6_ptr(opt, opt6_len(opt));
-           int offset = 0;
-           
-           if (mopt == OPTION6_VENDOR_CLASS)
-             {
-               if (opt6_len(opt) < 4)
-                 continue;
-               
-               if (vendor->enterprise != opt6_uint(opt, 0, 4))
-                 continue;
-             
-               offset = 4;
-             }
-  
-           /* Note that format if user/vendor classes is different to DHCP options - no option types. */
-           for (enc_opt = opt6_ptr(opt, offset); enc_opt; enc_opt = opt6_user_vendor_next(enc_opt, enc_end))
-             for (i = 0; i <= (opt6_user_vendor_len(enc_opt) - vendor->len); i++)
-               if (memcmp(vendor->data, opt6_user_vendor_ptr(enc_opt, i), vendor->len) == 0)
-                 {
-                   vendor->netid.next = state->tags;
-                   state->tags = &vendor->netid;
-                   break;
-                 }
-         }
-     }
- 
-   if (option_bool(OPT_LOG_OPTS) && (opt = opt6_find(state->packet_options, state->end, OPTION6_VENDOR_CLASS, 4)))
-     my_syslog(MS_DHCP | LOG_INFO, _("%u vendor class: %u"), state->xid, opt6_uint(opt, 0, 4));
-   
-   /* dhcp-match. If we have hex-and-wildcards, look for a left-anchored match.
-      Otherwise assume the option is an array, and look for a matching element. 
-      If no data given, existence of the option is enough. This code handles 
-      V-I opts too. */
-   for (opt_cfg = daemon->dhcp_match6; opt_cfg; opt_cfg = opt_cfg->next)
-     {
-       int match = 0;
-       
-       if (opt_cfg->flags & DHOPT_RFC3925)
-         {
-           for (opt = opt6_find(state->packet_options, state->end, OPTION6_VENDOR_OPTS, 4);
-                opt;
-                opt = opt6_find(opt6_next(opt, state->end), state->end, OPTION6_VENDOR_OPTS, 4))
-             {
-               void *vopt;
-               void *vend = opt6_ptr(opt, opt6_len(opt));
-               
-               for (vopt = opt6_find(opt6_ptr(opt, 4), vend, opt_cfg->opt, 0);
-                    vopt;
-                    vopt = opt6_find(opt6_next(vopt, vend), vend, opt_cfg->opt, 0))
-                 if ((match = match_bytes(opt_cfg, opt6_ptr(vopt, 0), opt6_len(vopt))))
-                   break;
-             }
-           if (match)
-             break;
-         }
-       else
-         {
-           if (!(opt = opt6_find(state->packet_options, state->end, opt_cfg->opt, 1)))
-             continue;
-           
-           match = match_bytes(opt_cfg, opt6_ptr(opt, 0), opt6_len(opt));
-         } 
-   
-       if (match)
-         {
-           opt_cfg->netid->next = state->tags;
-           state->tags = opt_cfg->netid;
-         }
-     }
- 
-   if (state->mac_len != 0)
-     {
-       if (option_bool(OPT_LOG_OPTS))
-         {
-           print_mac(daemon->dhcp_buff, state->mac, state->mac_len);
-           my_syslog(MS_DHCP | LOG_INFO, _("%u client MAC address: %s"), state->xid, daemon->dhcp_buff);
-         }
- 
-       for (mac_opt = daemon->dhcp_macs; mac_opt; mac_opt = mac_opt->next)
-         if ((unsigned)mac_opt->hwaddr_len == state->mac_len &&
-             ((unsigned)mac_opt->hwaddr_type == state->mac_type || mac_opt->hwaddr_type == 0) &&
-             memcmp_masked(mac_opt->hwaddr, state->mac, state->mac_len, mac_opt->mask))
-           {
-             mac_opt->netid.next = state->tags;
-             state->tags = &mac_opt->netid;
-           }
-     }
-   
-   if ((opt = opt6_find(state->packet_options, state->end, OPTION6_FQDN, 1)))
-     {
-       /* RFC4704 refers */
-        int len = opt6_len(opt) - 1;
-        
-        state->fqdn_flags = opt6_uint(opt, 0, 1);
-        
-        /* Always force update, since the client has no way to do it itself. */
-        if (!option_bool(OPT_FQDN_UPDATE) && !(state->fqdn_flags & 0x01))
-          state->fqdn_flags |= 0x03;
-  
-        state->fqdn_flags &= ~0x04;
- 
-        if (len != 0 && len < 255)
-          {
-            unsigned char *pp, *op = opt6_ptr(opt, 1);
-            char *pq = daemon->dhcp_buff;
-            
-            pp = op;
-            while (*op != 0 && ((op + (*op)) - pp) < len)
-              {
-                memcpy(pq, op+1, *op);
-                pq += *op;
-                op += (*op)+1;
-                *(pq++) = '.';
-              }
-            
-            if (pq != daemon->dhcp_buff)
-              pq--;
-            *pq = 0;
-            
-            if (legal_hostname(daemon->dhcp_buff))
-              {
-                struct dhcp_match_name *m;
-                size_t nl = strlen(daemon->dhcp_buff);
-                
-                state->client_hostname = daemon->dhcp_buff;
-                
-                if (option_bool(OPT_LOG_OPTS))
-                  my_syslog(MS_DHCP | LOG_INFO, _("%u client provides name: %s"), state->xid, state->client_hostname);
-                
-                for (m = daemon->dhcp_name_match; m; m = m->next)
-                  {
-                    size_t ml = strlen(m->name);
-                    char save = 0;
-                    
-                    if (nl < ml)
-                      continue;
-                    if (nl > ml)
-                      {
-                        save = state->client_hostname[ml];
-                        state->client_hostname[ml] = 0;
-                      }
-                    
-                    if (hostname_isequal(state->client_hostname, m->name) &&
-                        (save == 0 || m->wildcard))
-                      {
-                        m->netid->next = state->tags;
-                        state->tags = m->netid;
-                      }
-                    
-                    if (save != 0)
-                      state->client_hostname[ml] = save;
-                  }
-              }
+lib/cookie.c-Curl_cookie_add": "struct Cookie *
+Curl_cookie_add(struct Curl_easy *data,
+                struct CookieInfo *c,
+                bool httpheader, /* TRUE if HTTP header-style line */
+                bool noexpire, /* if TRUE, skip remove_expired() */
+                const char *lineptr,   /* first character of the line */
+                const char *domain, /* default domain */
+                const char *path,   /* full path used when this cookie is set,
+                                       used to get default path for the cookie
+                                       unless set */
+                bool secure)  /* TRUE if connection is over secure origin */
+{
+  struct Cookie *clist;
+  struct Cookie *co;
+  struct Cookie *lastc = NULL;
+  struct Cookie *replace_co = NULL;
+  struct Cookie *replace_clist = NULL;
+  time_t now = time(NULL);
+  bool replace_old = FALSE;
+  bool badcookie = FALSE; /* cookies are good by default. mmmmm yummy */
+  size_t myhash;
+  DEBUGASSERT(data);
+  DEBUGASSERT(MAX_SET_COOKIE_AMOUNT <= 255); /* counter is an unsigned char */
+  if(data->req.setcookies >= MAX_SET_COOKIE_AMOUNT)
+    return NULL;
+  /* First, alloc and init a new struct for it */
+  co = calloc(1, sizeof(struct Cookie));
+  if(!co)
+    return NULL; /* bail out if we're this low on memory */
+  if(httpheader) {
+    /* This line was read off an HTTP-header */
+    const char *ptr;
+    size_t linelength = strlen(lineptr);
+    if(linelength > MAX_COOKIE_LINE) {
+      /* discard overly long lines at once */
+      free(co);
+      return NULL;
+    }
+    ptr = lineptr;
+    do {
+      size_t vlen;
+      size_t nlen;
+      while(*ptr && ISBLANK(*ptr))
+        ptr++;
+      /* we have a <name>=<value> pair or a stand-alone word here */
+      nlen = strcspn(ptr, ";	
+
+=");
+      if(nlen) {
+        bool done = FALSE;
+        bool sep = FALSE;
+        const char *namep = ptr;
+        const char *valuep;
+        ptr += nlen;
+        /* trim trailing spaces and tabs after name */
+        while(nlen && ISBLANK(namep[nlen - 1]))
+          nlen--;
+        if(*ptr == '=') {
+          vlen = strcspn(++ptr, ";
+
+");
+          valuep = ptr;
+          sep = TRUE;
+          ptr = &valuep[vlen];
+          /* Strip off trailing whitespace from the value */
+          while(vlen && ISBLANK(valuep[vlen-1]))
+            vlen--;
+          /* Skip leading whitespace from the value */
+          while(vlen && ISBLANK(*valuep)) {
+            valuep++;
+            vlen--;
           }
-     }    
-   
-   if (state->clid &&
-       (config = find_config(daemon->dhcp_conf, state->context, state->clid, state->clid_len,
-                             state->mac, state->mac_len, state->mac_type, NULL, run_tag_if(state->tags))) &&
-       have_config(config, CONFIG_NAME))
-     {
-       state->hostname = config->hostname;
-       state->domain = config->domain;
-       state->hostname_auth = 1;
-     }
-   else if (state->client_hostname)
-     {
-       state->domain = strip_hostname(state->client_hostname);
-       
-       if (strlen(state->client_hostname) != 0)
-         {
-           state->hostname = state->client_hostname;
-           
-           if (!config)
-             {
-               /* Search again now we have a hostname. 
-                  Only accept configs without CLID here, (it won't match)
-                  to avoid impersonation by name. */
-               struct dhcp_config *new = find_config(daemon->dhcp_conf, state->context, NULL, 0, NULL, 0, 0, state->hostname, run_tag_if(state->tags));
-               if (new && !have_config(new, CONFIG_CLID) && !new->hwaddr)
-                 config = new;
-             }
-         }
-     }
- 
-   if (config)
-     {
-       struct dhcp_netid_list *list;
-       
-       for (list = config->netid; list; list = list->next)
-         {
-           list->list->next = state->tags;
-           state->tags = list->list;
-         }
- 
-       /* set "known" tag for known hosts */
-       known_id.net = "known";
-       known_id.next = state->tags;
-       state->tags = &known_id;
- 
-       if (have_config(config, CONFIG_DISABLE))
-         ignore = 1;
-     }
-   else if (state->clid &&
-            find_config(daemon->dhcp_conf, NULL, state->clid, state->clid_len,
-                        state->mac, state->mac_len, state->mac_type, NULL, run_tag_if(state->tags)))
-     {
-       known_id.net = "known-othernet";
-       known_id.next = state->tags;
-       state->tags = &known_id;
-     }
-   
-   tagif = run_tag_if(state->tags);
-   
-   /* if all the netids in the ignore list are present, ignore this client */
-   if (daemon->dhcp_ignore)
-     {
-       struct dhcp_netid_list *id_list;
-      
-       for (id_list = daemon->dhcp_ignore; id_list; id_list = id_list->next)
-         if (match_netid(id_list->list, tagif, 0))
-           ignore = 1;
-     }
-   
-   /* if all the netids in the ignore_name list are present, ignore client-supplied name */
-   if (!state->hostname_auth)
-     {
-        struct dhcp_netid_list *id_list;
-        
-        for (id_list = daemon->dhcp_ignore_names; id_list; id_list = id_list->next)
-          if ((!id_list->list) || match_netid(id_list->list, tagif, 0))
+          /* Reject cookies with a TAB inside the value */
+          if(memchr(valuep, '	', vlen)) {
+            freecookie(co);
+            infof(data, "cookie contains TAB, dropping");
+            return NULL;
+          }
+        }
+        else {
+          valuep = NULL;
+          vlen = 0;
+        }
+        /*
+         * Check for too long individual name or contents, or too long
+         * combination of name + contents. Chrome and Firefox support 4095 or
+         * 4096 bytes combo
+         */
+        if(nlen >= (MAX_NAME-1) || vlen >= (MAX_NAME-1) ||
+           ((nlen + vlen) > MAX_NAME)) {
+          freecookie(co);
+          infof(data, "oversized cookie dropped, name/val %zu + %zu bytes",
+                nlen, vlen);
+          return NULL;
+        }
+        /*
+         * Check if we have a reserved prefix set before anything else, as we
+         * otherwise have to test for the prefix in both the cookie name and
+         * "the rest". Prefixes must start with '__' and end with a '-', so
+         * only test for names where that can possibly be true.
+         */
+        if(nlen >= 7 && namep[0] == '_' && namep[1] == '_') {
+          if(strncasecompare("__Secure-", namep, 9))
+            co->prefix |= COOKIE_PREFIX__SECURE;
+          else if(strncasecompare("__Host-", namep, 7))
+            co->prefix |= COOKIE_PREFIX__HOST;
+        }
+        /*
+         * Use strstore() below to properly deal with received cookie
+         * headers that have the same string property set more than once,
+         * and then we use the last one.
+         */
+        if(!co->name) {
+          /* The very first name/value pair is the actual cookie name */
+          if(!sep) {
+            /* Bad name/value pair. */
+            badcookie = TRUE;
             break;
-        if (id_list)
-          state->hostname = NULL;
-     }
-   
- 
-   switch (msg_type)
-     {
-     default:
-       return 0;
-       
-       
-     case DHCP6SOLICIT:
-       {
-         int address_assigned = 0;
-         /* tags without all prefix-class tags */
-         struct dhcp_netid *solicit_tags;
-         struct dhcp_context *c;
-         
-         *outmsgtypep = DHCP6ADVERTISE;
-         
-         if (opt6_find(state->packet_options, state->end, OPTION6_RAPID_COMMIT, 0))
-           {
-             *outmsgtypep = DHCP6REPLY;
-             state->lease_allocate = 1;
-             o = new_opt6(OPTION6_RAPID_COMMIT);
-             end_opt6(o);
-           }
-         
-         log6_quiet(state, "DHCPSOLICIT", NULL, ignore ? _("ignored") : NULL);
- 
-       request_no_address:
-         solicit_tags = tagif;
-         
-         if (ignore)
-           return 0;
-         
-         /* reset USED bits in leases */
-         lease6_reset();
- 
-         /* Can use configured address max once per prefix */
-         for (c = state->context; c; c = c->current)
-           c->flags &= ~CONTEXT_CONF_USED;
- 
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {   
-             void *ia_option, *ia_end;
-             unsigned int min_time = 0xffffffff;
-             int t1cntr;
-             int ia_counter;
-             /* set unless we're sending a particular prefix-class, when we
-                want only dhcp-ranges with the correct tags set and not those without any tags. */
-             int plain_range = 1;
-             u32 lease_time;
-             struct dhcp_lease *ltmp;
-             struct in6_addr req_addr, addr;
-             
-             if (!check_ia(state, opt, &ia_end, &ia_option))
-               continue;
-             
-             /* reset USED bits in contexts - one address per prefix per IAID */
-             for (c = state->context; c; c = c->current)
-               c->flags &= ~CONTEXT_USED;
- 
-             o = build_ia(state, &t1cntr);
-             if (address_assigned)
-                 address_assigned = 2;
- 
-             for (ia_counter = 0; ia_option; ia_counter++, ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24))
-               {
-                 /* worry about alignment here. */
-                 memcpy(&req_addr, opt6_ptr(ia_option, 0), IN6ADDRSZ);
-                                 
-                 if ((c = address6_valid(state->context, &req_addr, solicit_tags, plain_range)))
-                   {
-                     lease_time = c->lease_time;
-                     /* If the client asks for an address on the same network as a configured address, 
-                        offer the configured address instead, to make moving to newly-configured
-                        addresses automatic. */
-                     if (!(c->flags & CONTEXT_CONF_USED) && config_valid(config, c, &addr, state, now))
-                       {
-                         req_addr = addr;
-                         mark_config_used(c, &addr);
-                         if (have_config(config, CONFIG_TIME))
-                           lease_time = config->lease_time;
-                       }
-                     else if (!(c = address6_available(state->context, &req_addr, solicit_tags, plain_range)))
-                       continue; /* not an address we're allowed */
-                     else if (!check_address(state, &req_addr))
-                       continue; /* address leased elsewhere */
-                     
-                     /* add address to output packet */
-                     add_address(state, c, lease_time, ia_option, &min_time, &req_addr, now);
-                     mark_context_used(state, &req_addr);
-                     get_context_tag(state, c);
-                     address_assigned = 1;
-                   }
-               }
-             
-             /* Suggest configured address(es) */
-             for (c = state->context; c; c = c->current) 
-               if (!(c->flags & CONTEXT_CONF_USED) &&
-                   match_netid(c->filter, solicit_tags, plain_range) &&
-                   config_valid(config, c, &addr, state, now))
-                 {
-                   mark_config_used(state->context, &addr);
-                   if (have_config(config, CONFIG_TIME))
-                     lease_time = config->lease_time;
-                   else
-                     lease_time = c->lease_time;
- 
-                   /* add address to output packet */
-                   add_address(state, c, lease_time, NULL, &min_time, &addr, now);
-                   mark_context_used(state, &addr);
-                   get_context_tag(state, c);
-                   address_assigned = 1;
-                 }
-             
-             /* return addresses for existing leases */
-             ltmp = NULL;
-             while ((ltmp = lease6_find_by_client(ltmp, state->ia_type == OPTION6_IA_NA ? LEASE_NA : LEASE_TA, state->clid, state->clid_len, state->iaid)))
-               {
-                 req_addr = ltmp->addr6;
-                 if ((c = address6_available(state->context, &req_addr, solicit_tags, plain_range)))
-                   {
-                     add_address(state, c, c->lease_time, NULL, &min_time, &req_addr, now);
-                     mark_context_used(state, &req_addr);
-                     get_context_tag(state, c);
-                     address_assigned = 1;
-                   }
-               }
-                            
-             /* Return addresses for all valid contexts which don't yet have one */
-             while ((c = address6_allocate(state->context, state->clid, state->clid_len, state->ia_type == OPTION6_IA_TA,
-                                           state->iaid, ia_counter, solicit_tags, plain_range, &addr)))
-               {
-                 add_address(state, c, c->lease_time, NULL, &min_time, &addr, now);
-                 mark_context_used(state, &addr);
-                 get_context_tag(state, c);
-                 address_assigned = 1;
-               }
-             
-             if (address_assigned != 1)
-               {
-                 /* If the server will not assign any addresses to any IAs in a
-                    subsequent Request from the client, the server MUST send an Advertise
-                    message to the client that doesn't include any IA options. */
-                 if (!state->lease_allocate)
-                   {
-                     save_counter(o);
-                     continue;
-                   }
-                 
-                 /* If the server cannot assign any addresses to an IA in the message
-                    from the client, the server MUST include the IA in the Reply message
-                    with no addresses in the IA and a Status Code option in the IA
-                    containing status code NoAddrsAvail. */
-                 o1 = new_opt6(OPTION6_STATUS_CODE);
-                 put_opt6_short(DHCP6NOADDRS);
-                 put_opt6_string(_("address unavailable"));
-                 end_opt6(o1);
-               }
-             
-             end_ia(t1cntr, min_time, 0);
-             end_opt6(o);        
-           }
- 
-         if (address_assigned) 
-           {
-             o1 = new_opt6(OPTION6_STATUS_CODE);
-             put_opt6_short(DHCP6SUCCESS);
-             put_opt6_string(_("success"));
-             end_opt6(o1);
-             
-             /* If --dhcp-authoritative is set, we can tell client not to wait for
-                other possible servers */
-             o = new_opt6(OPTION6_PREFERENCE);
-             put_opt6_char(option_bool(OPT_AUTHORITATIVE) ? 255 : 0);
-             end_opt6(o);
-             tagif = add_options(state, 0);
-           }
-         else
-           { 
-             /* no address, return error */
-             o1 = new_opt6(OPTION6_STATUS_CODE);
-             put_opt6_short(DHCP6NOADDRS);
-             put_opt6_string(_("no addresses available"));
-             end_opt6(o1);
- 
-             /* Some clients will ask repeatedly when we're not giving
-                out addresses because we're in stateless mode. Avoid spamming
-                the log in that case. */
-             for (c = state->context; c; c = c->current)
-               if (!(c->flags & CONTEXT_RA_STATELESS))
-                 {
-                   log6_packet(state, state->lease_allocate ? "DHCPREPLY" : "DHCPADVERTISE", NULL, _("no addresses available"));
-                   break;
-                 }
-           }
- 
-         break;
-       }
-       
-     case DHCP6REQUEST:
-       {
-         int address_assigned = 0;
-         int start = save_counter(-1);
- 
-         /* set reply message type */
-         *outmsgtypep = DHCP6REPLY;
-         state->lease_allocate = 1;
- 
-         log6_quiet(state, "DHCPREQUEST", NULL, ignore ? _("ignored") : NULL);
-         
-         if (ignore)
-           return 0;
-         
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {   
-             void *ia_option, *ia_end;
-             unsigned int min_time = 0xffffffff;
-             int t1cntr;
-             
-              if (!check_ia(state, opt, &ia_end, &ia_option))
-                continue;
- 
-              if (!ia_option)
-                {
-                  /* If we get a request with an IA_*A without addresses, treat it exactly like
-                     a SOLICT with rapid commit set. */
-                  save_counter(start);
-                  goto request_no_address; 
-                }
- 
-             o = build_ia(state, &t1cntr);
-               
-             for (; ia_option; ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24))
-               {
-                 struct in6_addr req_addr;
-                 struct dhcp_context *dynamic, *c;
-                 unsigned int lease_time;
-                 int config_ok = 0;
- 
-                 /* align. */
-                 memcpy(&req_addr, opt6_ptr(ia_option, 0), IN6ADDRSZ);
-                 
-                 if ((c = address6_valid(state->context, &req_addr, tagif, 1)))
-                   config_ok = (config_implies(config, c, &req_addr) != NULL);
-                 
-                 if ((dynamic = address6_available(state->context, &req_addr, tagif, 1)) || c)
-                   {
-                     if (!dynamic && !config_ok)
-                       {
-                         /* Static range, not configured. */
-                         o1 = new_opt6(OPTION6_STATUS_CODE);
-                         put_opt6_short(DHCP6NOADDRS);
-                         put_opt6_string(_("address unavailable"));
-                         end_opt6(o1);
-                       }
-                     else if (!check_address(state, &req_addr))
-                       {
-                         /* Address leased to another DUID/IAID */
-                         o1 = new_opt6(OPTION6_STATUS_CODE);
-                         put_opt6_short(DHCP6UNSPEC);
-                         put_opt6_string(_("address in use"));
-                         end_opt6(o1);
-                       } 
-                     else 
-                       {
-                         if (!dynamic)
-                           dynamic = c;
- 
-                         lease_time = dynamic->lease_time;
-                         
-                         if (config_ok && have_config(config, CONFIG_TIME))
-                           lease_time = config->lease_time;
- 
-                         add_address(state, dynamic, lease_time, ia_option, &min_time, &req_addr, now);
-                         get_context_tag(state, dynamic);
-                         address_assigned = 1;
-                       }
-                   }
-                 else 
-                   {
-                     /* requested address not on the correct link */
-                     o1 = new_opt6(OPTION6_STATUS_CODE);
-                     put_opt6_short(DHCP6NOTONLINK);
-                     put_opt6_string(_("not on link"));
-                     end_opt6(o1);
-                   }
-               }
-          
-             end_ia(t1cntr, min_time, 0);
-             end_opt6(o);        
-           }
- 
-         if (address_assigned) 
-           {
-             o1 = new_opt6(OPTION6_STATUS_CODE);
-             put_opt6_short(DHCP6SUCCESS);
-             put_opt6_string(_("success"));
-             end_opt6(o1);
-           }
-         else
-           { 
-             /* no address, return error */
-             o1 = new_opt6(OPTION6_STATUS_CODE);
-             put_opt6_short(DHCP6NOADDRS);
-             put_opt6_string(_("no addresses available"));
-             end_opt6(o1);
-             log6_packet(state, "DHCPREPLY", NULL, _("no addresses available"));
-           }
- 
-         tagif = add_options(state, 0);
-         break;
-       }
-       
-   
-     case DHCP6RENEW:
-     case DHCP6REBIND:
-       {
-         int address_assigned = 0;
- 
-         /* set reply message type */
-         *outmsgtypep = DHCP6REPLY;
-         
-         log6_quiet(state, msg_type == DHCP6RENEW ? "DHCPRENEW" : "DHCPREBIND", NULL, NULL);
- 
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {
-             void *ia_option, *ia_end;
-             unsigned int min_time = 0xffffffff;
-             int t1cntr, iacntr;
-             
-             if (!check_ia(state, opt, &ia_end, &ia_option))
-               continue;
-             
-             o = build_ia(state, &t1cntr);
-             iacntr = save_counter(-1); 
-             
-             for (; ia_option; ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24))
-               {
-                 struct dhcp_lease *lease = NULL;
-                 struct in6_addr req_addr;
-                 unsigned int preferred_time =  opt6_uint(ia_option, 16, 4);
-                 unsigned int valid_time =  opt6_uint(ia_option, 20, 4);
-                 char *message = NULL;
-                 struct dhcp_context *this_context;
- 
-                 memcpy(&req_addr, opt6_ptr(ia_option, 0), IN6ADDRSZ); 
-                 
-                 if (!(lease = lease6_find(state->clid, state->clid_len,
-                                           state->ia_type == OPTION6_IA_NA ? LEASE_NA : LEASE_TA, 
-                                           state->iaid, &req_addr)))
-                   {
-                     if (msg_type == DHCP6REBIND)
-                       {
-                         /* When rebinding, we can create a lease if it doesn't exist. */
-                         lease = lease6_allocate(&req_addr, state->ia_type == OPTION6_IA_NA ? LEASE_NA : LEASE_TA);
-                         if (lease)
-                           lease_set_iaid(lease, state->iaid);
-                         else
-                           break;
-                       }
-                     else
-                       {
-                         /* If the server cannot find a client entry for the IA the server
-                            returns the IA containing no addresses with a Status Code option set
-                            to NoBinding in the Reply message. */
-                         save_counter(iacntr);
-                         t1cntr = 0;
-                         
-                         log6_packet(state, "DHCPREPLY", &req_addr, _("lease not found"));
-                         
-                         o1 = new_opt6(OPTION6_STATUS_CODE);
-                         put_opt6_short(DHCP6NOBINDING);
-                         put_opt6_string(_("no binding found"));
-                         end_opt6(o1);
-                         
-                         preferred_time = valid_time = 0;
-                         break;
-                       }
-                   }
-                 
-                 if ((this_context = address6_available(state->context, &req_addr, tagif, 1)) ||
-                     (this_context = address6_valid(state->context, &req_addr, tagif, 1)))
-                   {
-                     unsigned int lease_time;
- 
-                     get_context_tag(state, this_context);
-                     
-                     if (config_implies(config, this_context, &req_addr) && have_config(config, CONFIG_TIME))
-                       lease_time = config->lease_time;
-                     else 
-                       lease_time = this_context->lease_time;
-                     
-                     calculate_times(this_context, &min_time, &valid_time, &preferred_time, lease_time); 
-                     
-                     lease_set_expires(lease, valid_time, now);
-                     /* Update MAC record in case it's new information. */
-                     if (state->mac_len != 0)
-                       lease_set_hwaddr(lease, state->mac, state->clid, state->mac_len, state->mac_type, state->clid_len, now, 0);
-                     if (state->ia_type == OPTION6_IA_NA && state->hostname)
-                       {
-                         char *addr_domain = get_domain6(&req_addr);
-                         if (!state->send_domain)
-                           state->send_domain = addr_domain;
-                         lease_set_hostname(lease, state->hostname, state->hostname_auth, addr_domain, state->domain); 
-                         message = state->hostname;
-                       }
-                     
-                     
-                     if (preferred_time == 0)
-                       message = _("deprecated");
- 
-                     address_assigned = 1;
-                   }
-                 else
-                   {
-                     preferred_time = valid_time = 0;
-                     message = _("address invalid");
-                   } 
- 
-                 if (message && (message != state->hostname))
-                   log6_packet(state, "DHCPREPLY", &req_addr, message);  
-                 else
-                   log6_quiet(state, "DHCPREPLY", &req_addr, message);
-         
-                 o1 =  new_opt6(OPTION6_IAADDR);
-                 put_opt6(&req_addr, sizeof(req_addr));
-                 put_opt6_long(preferred_time);
-                 put_opt6_long(valid_time);
-                 end_opt6(o1);
-               }
-             
-             end_ia(t1cntr, min_time, 1);
-             end_opt6(o);
-           }
- 
-         if (!address_assigned && msg_type == DHCP6REBIND)
-           { 
-             /* can't create lease for any address, return error */
-             o1 = new_opt6(OPTION6_STATUS_CODE);
-             put_opt6_short(DHCP6NOADDRS);
-             put_opt6_string(_("no addresses available"));
-             end_opt6(o1);
-           }
-         
-         tagif = add_options(state, 0);
-         break;
-       }
-       
-     case DHCP6CONFIRM:
-       {
-         int good_addr = 0;
- 
-         /* set reply message type */
-         *outmsgtypep = DHCP6REPLY;
-         
-         log6_quiet(state, "DHCPCONFIRM", NULL, NULL);
-         
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {
-             void *ia_option, *ia_end;
-             
-             for (check_ia(state, opt, &ia_end, &ia_option);
-                  ia_option;
-                  ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24))
-               {
-                 struct in6_addr req_addr;
- 
-                 /* alignment */
-                 memcpy(&req_addr, opt6_ptr(ia_option, 0), IN6ADDRSZ);
-                 
-                 if (!address6_valid(state->context, &req_addr, tagif, 1))
-                   {
-                     o1 = new_opt6(OPTION6_STATUS_CODE);
-                     put_opt6_short(DHCP6NOTONLINK);
-                     put_opt6_string(_("confirm failed"));
-                     end_opt6(o1);
-                     log6_quiet(state, "DHCPREPLY", &req_addr, _("confirm failed"));
-                     return 1;
-                   }
- 
-                 good_addr = 1;
-                 log6_quiet(state, "DHCPREPLY", &req_addr, state->hostname);
-               }
-           }      
-         
-         /* No addresses, no reply: RFC 3315 18.2.2 */
-         if (!good_addr)
-           return 0;
- 
-         o1 = new_opt6(OPTION6_STATUS_CODE);
-         put_opt6_short(DHCP6SUCCESS );
-         put_opt6_string(_("all addresses still on link"));
-         end_opt6(o1);
-         break;
-     }
-       
-     case DHCP6IREQ:
-       {
-         /* We can't discriminate contexts based on address, as we don't know it.
-            If there is only one possible context, we can use its tags */
-         if (state->context && state->context->netid.net && !state->context->current)
-           {
-             state->context->netid.next = NULL;
-             state->context_tags =  &state->context->netid;
-           }
- 
-         /* Similarly, we can't determine domain from address, but if the FQDN is
-            given in --dhcp-host, we can use that, and failing that we can use the 
-            unqualified configured domain, if any. */
-         if (state->hostname_auth)
-           state->send_domain = state->domain;
-         else
-           state->send_domain = get_domain6(NULL);
- 
-         log6_quiet(state, "DHCPINFORMATION-REQUEST", NULL, ignore ? _("ignored") : state->hostname);
-         if (ignore)
-           return 0;
-         *outmsgtypep = DHCP6REPLY;
-         tagif = add_options(state, 1);
-         break;
-       }
-       
-       
-     case DHCP6RELEASE:
-       {
-         /* set reply message type */
-         *outmsgtypep = DHCP6REPLY;
- 
-         log6_quiet(state, "DHCPRELEASE", NULL, NULL);
- 
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {
-             void *ia_option, *ia_end;
-             int made_ia = 0;
-                     
-             for (check_ia(state, opt, &ia_end, &ia_option);
-                  ia_option;
-                  ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24)) 
-               {
-                 struct dhcp_lease *lease;
-                 struct in6_addr addr;
- 
-                 /* align */
-                 memcpy(&addr, opt6_ptr(ia_option, 0), IN6ADDRSZ);
-                 if ((lease = lease6_find(state->clid, state->clid_len, state->ia_type == OPTION6_IA_NA ? LEASE_NA : LEASE_TA,
-                                          state->iaid, &addr)))
-                   lease_prune(lease, now);
-                 else
-                   {
-                     if (!made_ia)
-                       {
-                         o = new_opt6(state->ia_type);
-                         put_opt6_long(state->iaid);
-                         if (state->ia_type == OPTION6_IA_NA)
-                           {
-                             put_opt6_long(0);
-                             put_opt6_long(0); 
-                           }
-                         made_ia = 1;
-                       }
-                     
-                     o1 = new_opt6(OPTION6_IAADDR);
-                     put_opt6(&addr, IN6ADDRSZ);
-                     put_opt6_long(0);
-                     put_opt6_long(0);
-                     end_opt6(o1);
-                   }
-               }
-             
-             if (made_ia)
-               {
-                 o1 = new_opt6(OPTION6_STATUS_CODE);
-                 put_opt6_short(DHCP6NOBINDING);
-                 put_opt6_string(_("no binding found"));
-                 end_opt6(o1);
-                 
-                 end_opt6(o);
-               }
-           }
-         
-         o1 = new_opt6(OPTION6_STATUS_CODE);
-         put_opt6_short(DHCP6SUCCESS);
-         put_opt6_string(_("release received"));
-         end_opt6(o1);
-         
-         break;
-       }
- 
-     case DHCP6DECLINE:
-       {
-         /* set reply message type */
-         *outmsgtypep = DHCP6REPLY;
-         
-         log6_quiet(state, "DHCPDECLINE", NULL, NULL);
- 
-         for (opt = state->packet_options; opt; opt = opt6_next(opt, state->end))
-           {
-             void *ia_option, *ia_end;
-             int made_ia = 0;
-                     
-             for (check_ia(state, opt, &ia_end, &ia_option);
-                  ia_option;
-                  ia_option = opt6_find(opt6_next(ia_option, ia_end), ia_end, OPTION6_IAADDR, 24)) 
-               {
-                 struct dhcp_lease *lease;
-                 struct in6_addr addr;
-                 struct addrlist *addr_list;
-                 
-                 /* align */
-                 memcpy(&addr, opt6_ptr(ia_option, 0), IN6ADDRSZ);
- 
-                 if ((addr_list = config_implies(config, state->context, &addr)))
-                   {
-                     prettyprint_time(daemon->dhcp_buff3, DECLINE_BACKOFF);
-                     inet_ntop(AF_INET6, &addr, daemon->addrbuff, ADDRSTRLEN);
-                     my_syslog(MS_DHCP | LOG_WARNING, _("disabling DHCP static address %s for %s"), 
-                               daemon->addrbuff, daemon->dhcp_buff3);
-                     addr_list->flags |= ADDRLIST_DECLINED;
-                     addr_list->decline_time = now;
-                   }
-                 else
-                   /* make sure this host gets a different address next time. */
-                   for (context_tmp = state->context; context_tmp; context_tmp = context_tmp->current)
-                     context_tmp->addr_epoch++;
-                 
-                 if ((lease = lease6_find(state->clid, state->clid_len, state->ia_type == OPTION6_IA_NA ? LEASE_NA : LEASE_TA,
-                                          state->iaid, &addr)))
-                   lease_prune(lease, now);
-                 else
-                   {
-                     if (!made_ia)
-                       {
-                         o = new_opt6(state->ia_type);
-                         put_opt6_long(state->iaid);
-                         if (state->ia_type == OPTION6_IA_NA)
-                           {
-                             put_opt6_long(0);
-                             put_opt6_long(0); 
-                           }
-                         made_ia = 1;
-                       }
-                     
-                     o1 = new_opt6(OPTION6_IAADDR);
-                     put_opt6(&addr, IN6ADDRSZ);
-                     put_opt6_long(0);
-                     put_opt6_long(0);
-                     end_opt6(o1);
-                   }
-               }
-             
-             if (made_ia)
-               {
-                 o1 = new_opt6(OPTION6_STATUS_CODE);
-                 put_opt6_short(DHCP6NOBINDING);
-                 put_opt6_string(_("no binding found"));
-                 end_opt6(o1);
-                 
-                 end_opt6(o);
-               }
-             
-           }
- 
-         /* We must answer with 'success' in global section anyway */
-         o1 = new_opt6(OPTION6_STATUS_CODE);
-         put_opt6_short(DHCP6SUCCESS);
-         put_opt6_string(_("success"));
-         end_opt6(o1);
-         break;
-       }
- 
-     }
-   
-   log_tags(tagif, state->xid);
-   log6_opts(0, state->xid, daemon->outpacket.iov_base + start_opts, daemon->outpacket.iov_base + save_counter(-1));
-   
-   return 1;
- 
- }
+          }
+          strstore(&co->name, namep, nlen);
+          strstore(&co->value, valuep, vlen);
+          done = TRUE;
+          if(!co->name || !co->value) {
+            badcookie = TRUE;
+            break;
+          }
+          if(invalid_octets(co->value) || invalid_octets(co->name)) {
+            infof(data, "invalid octets in name/value, cookie dropped");
+            badcookie = TRUE;
+            break;
+          }
+        }
+        else if(!vlen) {
+          /*
+           * this was a "<name>=" with no content, and we must allow
+           * 'secure' and 'httponly' specified this weirdly
+           */
+          done = TRUE;
+          /*
+           * secure cookies are only allowed to be set when the connection is
+           * using a secure protocol, or when the cookie is being set by
+           * reading from file
+           */
+          if((nlen == 6) && strncasecompare("secure", namep, 6)) {
+            if(secure || !c->running) {
+              co->secure = TRUE;
+            }
+            else {
+              badcookie = TRUE;
+              break;
+            }
+          }
+          else if((nlen == 8) && strncasecompare("httponly", namep, 8))
+            co->httponly = TRUE;
+          else if(sep)
+            /* there was a '=' so we're not done parsing this field */
+            done = FALSE;
+        }
+        if(done)
+          ;
+        else if((nlen == 4) && strncasecompare("path", namep, 4)) {
+          strstore(&co->path, valuep, vlen);
+          if(!co->path) {
+            badcookie = TRUE; /* out of memory bad */
+            break;
+          }
+          free(co->spath); /* if this is set again */
+          co->spath = sanitize_cookie_path(co->path);
+          if(!co->spath) {
+            badcookie = TRUE; /* out of memory bad */
+            break;
+          }
+        }
+        else if((nlen == 6) &&
+                strncasecompare("domain", namep, 6) && vlen) {
+          bool is_ip;
+          /*
+           * Now, we make sure that our host is within the given domain, or
+           * the given domain is not valid and thus cannot be set.
+           */
+          if('.' == valuep[0]) {
+            valuep++; /* ignore preceding dot */
+            vlen--;
+          }
+#ifndef USE_LIBPSL
+          /*
+           * Without PSL we don't know when the incoming cookie is set on a
+           * TLD or otherwise "protected" suffix. To reduce risk, we require a
+           * dot OR the exact host name being "localhost".
+           */
+          if(bad_domain(valuep, vlen))
+            domain = ":";
+#endif
+          is_ip = Curl_host_is_ipnum(domain ? domain : valuep);
+          if(!domain
+             || (is_ip && !strncmp(valuep, domain, vlen) &&
+                 (vlen == strlen(domain)))
+             || (!is_ip && cookie_tailmatch(valuep, vlen, domain))) {
+            strstore(&co->domain, valuep, vlen);
+            if(!co->domain) {
+              badcookie = TRUE;
+              break;
+            }
+            if(!is_ip)
+              co->tailmatch = TRUE; /* we always do that if the domain name was
+                                       given */
+          }
+          else {
+            /*
+             * We did not get a tailmatch and then the attempted set domain is
+             * not a domain to which the current host belongs. Mark as bad.
+             */
+            badcookie = TRUE;
+            infof(data, "skipped cookie with bad tailmatch domain: %s",
+                  valuep);
+          }
+        }
+        else if((nlen == 7) && strncasecompare("version", namep, 7)) {
+          /* just ignore */
+        }
+        else if((nlen == 7) && strncasecompare("max-age", namep, 7)) {
+          /*
+           * Defined in RFC2109:
+           *
+           * Optional.  The Max-Age attribute defines the lifetime of the
+           * cookie, in seconds.  The delta-seconds value is a decimal non-
+           * negative integer.  After delta-seconds seconds elapse, the
+           * client should discard the cookie.  A value of zero means the
+           * cookie should be discarded immediately.
+           */
+          CURLofft offt;
+          const char *maxage = valuep;
+          offt = curlx_strtoofft((*maxage == '"')?
+                                 &maxage[1]:&maxage[0], NULL, 10,
+                                 &co->expires);
+          switch(offt) {
+          case CURL_OFFT_FLOW:
+            /* overflow, used max value */
+            co->expires = CURL_OFF_T_MAX;
+            break;
+          case CURL_OFFT_INVAL:
+            /* negative or otherwise bad, expire */
+            co->expires = 1;
+            break;
+          case CURL_OFFT_OK:
+            if(!co->expires)
+              /* already expired */
+              co->expires = 1;
+            else if(CURL_OFF_T_MAX - now < co->expires)
+              /* would overflow */
+              co->expires = CURL_OFF_T_MAX;
+            else
+              co->expires += now;
+            break;
+          }
+        }
+        else if((nlen == 7) && strncasecompare("expires", namep, 7)) {
+          char date[128];
+          if(!co->expires && (vlen < sizeof(date))) {
+            /* copy the date so that it can be null terminated */
+            memcpy(date, valuep, vlen);
+            date[vlen] = 0;
+            /*
+             * Let max-age have priority.
+             *
+             * If the date cannot get parsed for whatever reason, the cookie
+             * will be treated as a session cookie
+             */
+            co->expires = Curl_getdate_capped(date);
+            /*
+             * Session cookies have expires set to 0 so if we get that back
+             * from the date parser let's add a second to make it a
+             * non-session cookie
+             */
+            if(co->expires == 0)
+              co->expires = 1;
+            else if(co->expires < 0)
+              co->expires = 0;
+          }
+        }
+        /*
+         * Else, this is the second (or more) name we don't know about!
+         */
+      }
+      else {
+        /* this is an "illegal" <what>=<this> pair */
+      }
+      while(*ptr && ISBLANK(*ptr))
+        ptr++;
+      if(*ptr == ';')
+        ptr++;
+      else
+        break;
+    } while(1);
+    if(!badcookie && !co->domain) {
+      if(domain) {
+        /* no domain was given in the header line, set the default */
+        co->domain = strdup(domain);
+        if(!co->domain)
+          badcookie = TRUE;
+      }
+    }
+    if(!badcookie && !co->path && path) {
+      /*
+       * No path was given in the header line, set the default.  Note that the
+       * passed-in path to this function MAY have a '?' and following part that
+       * MUST NOT be stored as part of the path.
+       */
+      char *queryp = strchr(path, '?');
+      /*
+       * queryp is where the interesting part of the path ends, so now we
+       * want to the find the last
+       */
+      char *endslash;
+      if(!queryp)
+        endslash = strrchr(path, '/');
+      else
+        endslash = memrchr(path, '/', (queryp - path));
+      if(endslash) {
+        size_t pathlen = (endslash-path + 1); /* include end slash */
+        co->path = malloc(pathlen + 1); /* one extra for the zero byte */
+        if(co->path) {
+          memcpy(co->path, path, pathlen);
+          co->path[pathlen] = 0; /* null-terminate */
+          co->spath = sanitize_cookie_path(co->path);
+          if(!co->spath)
+            badcookie = TRUE; /* out of memory bad */
+        }
+        else
+          badcookie = TRUE;
+      }
+    }
+    /*
+     * If we didn't get a cookie name, or a bad one, the this is an illegal
+     * line so bail out.
+     */
+    if(badcookie || !co->name) {
+      freecookie(co);
+      return NULL;
+    }
+    data->req.setcookies++;
+  }
+  else {
+    /*
+     * This line is NOT an HTTP header style line, we do offer support for
+     * reading the odd netscape cookies-file format here
+     */
+    char *ptr;
+    char *firstptr;
+    char *tok_buf = NULL;
+    int fields;
+    /*
+     * IE introduced HTTP-only cookies to prevent XSS attacks. Cookies marked
+     * with httpOnly after the domain name are not accessible from javascripts,
+     * but since curl does not operate at javascript level, we include them
+     * anyway. In Firefox's cookie files, these lines are preceded with
+     * #HttpOnly_ and then everything is as usual, so we skip 10 characters of
+     * the line..
+     */
+    if(strncmp(lineptr, "#HttpOnly_", 10) == 0) {
+      lineptr += 10;
+      co->httponly = TRUE;
+    }
+    if(lineptr[0]=='#') {
+      /* don't even try the comments */
+      free(co);
+      return NULL;
+    }
+    /* strip off the possible end-of-line characters */
+    ptr = strchr(lineptr, '
+');
+    if(ptr)
+      *ptr = 0; /* clear it */
+    ptr = strchr(lineptr, '
+');
+    if(ptr)
+      *ptr = 0; /* clear it */
+    firstptr = strtok_r((char *)lineptr, "	", &tok_buf); /* tokenize on TAB */
+    /*
+     * Now loop through the fields and init the struct we already have
+     * allocated
+     */
+    for(ptr = firstptr, fields = 0; ptr && !badcookie;
+        ptr = strtok_r(NULL, "	", &tok_buf), fields++) {
+      switch(fields) {
+      case 0:
+        if(ptr[0]=='.') /* skip preceding dots */
+          ptr++;
+        co->domain = strdup(ptr);
+        if(!co->domain)
+          badcookie = TRUE;
+        break;
+      case 1:
+        /*
+         * flag: A TRUE/FALSE value indicating if all machines within a given
+         * domain can access the variable. Set TRUE when the cookie says
+         * .domain.com and to false when the domain is complete www.domain.com
+         */
+        co->tailmatch = strcasecompare(ptr, "TRUE")?TRUE:FALSE;
+        break;
+      case 2:
+        /* The file format allows the path field to remain not filled in */
+        if(strcmp("TRUE", ptr) && strcmp("FALSE", ptr)) {
+          /* only if the path doesn't look like a boolean option! */
+          co->path = strdup(ptr);
+          if(!co->path)
+            badcookie = TRUE;
+          else {
+            co->spath = sanitize_cookie_path(co->path);
+            if(!co->spath) {
+              badcookie = TRUE; /* out of memory bad */
+            }
+          }
+          break;
+        }
+        /* this doesn't look like a path, make one up! */
+        co->path = strdup("/");
+        if(!co->path)
+          badcookie = TRUE;
+        co->spath = strdup("/");
+        if(!co->spath)
+          badcookie = TRUE;
+        fields++; /* add a field and fall down to secure */
+        /* FALLTHROUGH */
+      case 3:
+        co->secure = FALSE;
+        if(strcasecompare(ptr, "TRUE")) {
+          if(secure || c->running)
+            co->secure = TRUE;
+          else
+            badcookie = TRUE;
+        }
+        break;
+      case 4:
+        if(curlx_strtoofft(ptr, NULL, 10, &co->expires))
+          badcookie = TRUE;
+        break;
+      case 5:
+        co->name = strdup(ptr);
+        if(!co->name)
+          badcookie = TRUE;
+        else {
+          /* For Netscape file format cookies we check prefix on the name */
+          if(strncasecompare("__Secure-", co->name, 9))
+            co->prefix |= COOKIE_PREFIX__SECURE;
+          else if(strncasecompare("__Host-", co->name, 7))
+            co->prefix |= COOKIE_PREFIX__HOST;
+        }
+        break;
+      case 6:
+        co->value = strdup(ptr);
+        if(!co->value)
+          badcookie = TRUE;
+        break;
+      }
+    }
+    if(6 == fields) {
+      /* we got a cookie with blank contents, fix it */
+      co->value = strdup("");
+      if(!co->value)
+        badcookie = TRUE;
+      else
+        fields++;
+    }
+    if(!badcookie && (7 != fields))
+      /* we did not find the sufficient number of fields */
+      badcookie = TRUE;
+    if(badcookie) {
+      freecookie(co);
+      return NULL;
+    }
+  }
+  if(co->prefix & COOKIE_PREFIX__SECURE) {
+    /* The __Secure- prefix only requires that the cookie be set secure */
+    if(!co->secure) {
+      freecookie(co);
+      return NULL;
+    }
+  }
+  if(co->prefix & COOKIE_PREFIX__HOST) {
+    /*
+     * The __Host- prefix requires the cookie to be secure, have a "/" path
+     * and not have a domain set.
+     */
+    if(co->secure && co->path && strcmp(co->path, "/") == 0 && !co->tailmatch)
+      ;
+    else {
+      freecookie(co);
+      return NULL;
+    }
+  }
+  if(!c->running &&    /* read from a file */
+     c->newsession &&  /* clean session cookies */
+     !co->expires) {   /* this is a session cookie since it doesn't expire! */
+    freecookie(co);
+    return NULL;
+  }
+  co->livecookie = c->running;
+  co->creationtime = ++c->lastct;
+  /*
+   * Now we have parsed the incoming line, we must now check if this supersedes
+   * an already existing cookie, which it may if the previous have the same
+   * domain and path as this.
+   */
+  /* at first, remove expired cookies */
+  if(!noexpire)
+    remove_expired(c);
+#ifdef USE_LIBPSL
+  /*
+   * Check if the domain is a Public Suffix and if yes, ignore the cookie. We
+   * must also check that the data handle isn't NULL since the psl code will
+   * dereference it.
+   */
+  if(data && (domain && co->domain && !Curl_host_is_ipnum(co->domain))) {
+    const psl_ctx_t *psl = Curl_psl_use(data);
+    int acceptable;
+
+    if(psl) {
+      acceptable = psl_is_cookie_domain_acceptable(psl, domain, co->domain);
+      Curl_psl_release(data);
+    }
+    else
+      acceptable = !bad_domain(domain, strlen(domain));
+
+    if(!acceptable) {
+      infof(data, "cookie '%s' dropped, domain '%s' must not "
+                  "set cookies for '%s'", co->name, domain, co->domain);
+      freecookie(co);
+      return NULL;
+    }
+  }
+#endif
+  /* A non-secure cookie may not overlay an existing secure cookie. */
+  myhash = cookiehash(co->domain);
+  clist = c->cookies[myhash];
+  while(clist) {
+    if(strcasecompare(clist->name, co->name)) {
+      /* the names are identical */
+      bool matching_domains = FALSE;
+      if(clist->domain && co->domain) {
+        if(strcasecompare(clist->domain, co->domain))
+          /* The domains are identical */
+          matching_domains = TRUE;
+      }
+      else if(!clist->domain && !co->domain)
+        matching_domains = TRUE;
+      if(matching_domains && /* the domains were identical */
+         clist->spath && co->spath && /* both have paths */
+         clist->secure && !co->secure && !secure) {
+        size_t cllen;
+        const char *sep;
+        /*
+         * A non-secure cookie may not overlay an existing secure cookie.
+         * For an existing cookie "a" with path "/login", refuse a new
+         * cookie "a" with for example path "/login/en", while the path
+         * "/loginhelper" is ok.
+         */
+        sep = strchr(clist->spath + 1, '/');
+        if(sep)
+          cllen = sep - clist->spath;
+        else
+          cllen = strlen(clist->spath);
+        if(strncasecompare(clist->spath, co->spath, cllen)) {
+          infof(data, "cookie '%s' for domain '%s' dropped, would "
+                "overlay an existing cookie", co->name, co->domain);
+          freecookie(co);
+          return NULL;
+        }
+      }
+    }
+    if(!replace_co && strcasecompare(clist->name, co->name)) {
+      /* the names are identical */
+      if(clist->domain && co->domain) {
+        if(strcasecompare(clist->domain, co->domain) &&
+          (clist->tailmatch == co->tailmatch))
+          /* The domains are identical */
+          replace_old = TRUE;
+      }
+      else if(!clist->domain && !co->domain)
+        replace_old = TRUE;
+      if(replace_old) {
+        /* the domains were identical */
+        if(clist->spath && co->spath &&
+           !strcasecompare(clist->spath, co->spath))
+          replace_old = FALSE;
+        else if(!clist->spath != !co->spath)
+          replace_old = FALSE;
+      }
+      if(replace_old && !co->livecookie && clist->livecookie) {
+        /*
+         * Both cookies matched fine, except that the already present cookie is
+         * "live", which means it was set from a header, while the new one was
+         * read from a file and thus isn't "live". "live" cookies are preferred
+         * so the new cookie is freed.
+         */
+        freecookie(co);
+        return NULL;
+      }
+      if(replace_old) {
+        replace_co = co;
+        replace_clist = clist;
+      }
+    }
+    lastc = clist;
+    clist = clist->next;
+  }
+  if(replace_co) {
+    co = replace_co;
+    clist = replace_clist;
+    co->next = clist->next; /* get the next-pointer first */
+    /* when replacing, creationtime is kept from old */
+    co->creationtime = clist->creationtime;
+    /* then free all the old pointers */
+    free(clist->name);
+    free(clist->value);
+    free(clist->domain);
+    free(clist->path);
+    free(clist->spath);
+    *clist = *co;  /* then store all the new data */
+    free(co);   /* free the newly allocated memory */
+    co = clist;
+  }
+  if(c->running)
+    /* Only show this when NOT reading the cookies from a file */
+    infof(data, "%s cookie %s="%s" for domain %s, path %s, "
+          "expire %" CURL_FORMAT_CURL_OFF_T,
+          replace_old?"Replaced":"Added", co->name, co->value,
+          co->domain, co->path, co->expires);
+  if(!replace_old) {
+    /* then make the last item point on this new one */
+    if(lastc)
+      lastc->next = co;
+    else
+      c->cookies[myhash] = co;
+    c->numcookies++; /* one more cookie in the jar */
+  }
+  /*
+   * Now that we've added a new cookie to the jar, update the expiration
+   * tracker in case it is the next one to expire.
+   */
+  if(co->expires && (co->expires < c->next_expiration))
+    c->next_expiration = co->expires;
+  return co;
+}
